@@ -4,6 +4,12 @@ PISG adds inference-time guidance to diffusion and consistency solvers for the t
 
 Authors: Yuming Zhang, Xianchen Zhou, Hongxia Wang. Bibliographic metadata is in [CITATION.cff](CITATION.cff). Paper: [OpenReview](https://openreview.net/forum?id=5G4RbpOCB8).
 
+<p align="center">
+  <img src="docs/assets/pisg_overview.png" alt="Overview of PISG" width="90%">
+</p>
+
+At every denoising step, PISG weakens the edge gates of a selected AGNN layer to obtain a structure-degraded prediction and extrapolates the normal prediction away from it, $p^{\text{guided}} = p^{\text{normal}} + s_t\,(p^{\text{normal}} - p^{\text{perturbed}})$. The guided prediction drives the next denoising step, and the final one goes to the solver's native decoder; no retraining is required. GenSCO uses the same extrapolation but perturbs its attention bias instead.
+
 Each solver keeps its native structure and environment:
 
 | Solver | Installation | Source delivery |
