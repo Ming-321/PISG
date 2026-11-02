@@ -185,7 +185,8 @@
     "copied_files": [
       {
         "path": "LICENSE",
-        "sha256": "744875635d02f3d789a4158cf722fca5dd042c74db1638d7366f268c62fdd107"
+        "sha256": "744875635d02f3d789a4158cf722fca5dd042c74db1638d7366f268c62fdd107",
+        "upstream_commit": "12be8e35e67ad9337e16aa718f3c2988a01beb40"
       },
       {
         "path": "diffusion/__init__.py",
@@ -391,7 +392,8 @@
       },
       {
         "path": "environment.yml",
-        "sha256": "5976c1cac29a6b560bac46650fc7de86325e5a600bb9645684f9e8637c4f1711"
+        "sha256": "5976c1cac29a6b560bac46650fc7de86325e5a600bb9645684f9e8637c4f1711",
+        "upstream_commit": "43639f50a92722746805c3cbde8c9687b518a660"
       },
       {
         "path": "train.py",

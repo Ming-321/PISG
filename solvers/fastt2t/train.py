@@ -136,7 +136,8 @@ def arg_parser():
              "use --pisg_tg to also enable PISG during rewrite. "
              "Only effective with --do_test --consistency. "
              "Recommended configs — TSP: s=2.0 l=7 adaptive linear; "
-             "MIS: s=1.0 l=7 uniform constant.",
+             "MIS-ER: s=2.0 l=7 uniform constant; "
+             "MIS-RB: s=2.0 l=7 adaptive constant.",
     )
     parser.add_argument(
         "--pisg_tg",
@@ -152,7 +153,7 @@ def arg_parser():
         help="Base guidance strength for PISG extrapolation. "
              "Formula: x_guided = x_normal + scale * (x_normal - x_perturbed). "
              "0 = degrade to baseline (no guidance). "
-             "Recommended: 2.0 (TSP), 1.0 (MIS).",
+             "Recommended: 2.0 (TSP and MIS).",
     )
     parser.add_argument(
         "--pisg_layers",
@@ -177,7 +178,7 @@ def arg_parser():
              "random-gate: replace with random values in [0,1]. "
              "shuffle-gate: randomly permute gate values within each graph. "
              "input-noise: add Gaussian noise to xt instead of perturbing gates (non-structural baseline). "
-             "Recommended: adaptive (TSP), uniform (MIS).",
+             "Recommended: adaptive (TSP, MIS-RB), uniform (MIS-ER).",
     )
     parser.add_argument(
         "--pisg_fusion_space",

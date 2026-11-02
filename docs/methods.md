@@ -10,6 +10,8 @@ PISG evaluates a normal denoising branch and a branch with selected internal gat
 | StruDiCO | `diffusion/models/gnn_encoder.py`, `diffusion/consistency/{tsp,mis}.py` | TSP scale0.1/layer7/adaptive/linear; ER0.1/layer9/uniform/constant; RB0.2/layer5/adaptive/constant; logit fusion |
 | GenSCO | patched model, transformer, attention, and flow-decoder modules | frozen hybrid TSP settings and selected MIS JSONs |
 
+Layer numbers are used as given, without shifting. For the four GNN solvers, the paper's layer labels (e.g., L7) and the `pisg_layers` values in configs and CLIs are the same 0-based indices into the 12-layer encoder (paper L7 = `--pisg_layers 7`; valid range 0–11). GenSCO's `pisg_layers` are 1-based decoder-layer indices, matching the paper's GenSCO appendix.
+
 The native CLIs document PISG flags. Selected scripts pass explicit inference budgets, checkpoint/data paths, seeds, and guidance settings. The original source supports additional historical research options, but this reproduction package schedules only the results listed in `reproduce/README.md`.
 
 StruDiCO retains its threshold merge decoder and stitch seed. Its main-table TSP500/1000 baseline and PISG decoder parameters follow the source experiment, including their differences. Deployment likewise preserves the recorded decoder settings: baseline `m1=m2=0.7` for TSP500 and `0.8` for TSP1000; PISG `m1=m2=0.6` for both sizes. Both settings use 2-opt at initial decoding and rewriting. FastT2T deployment likewise uses native 2-opt throughout. No batch-size or search-budget reduction is made for shared-GPU operation.
