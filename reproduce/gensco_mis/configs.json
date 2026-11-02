@@ -1,0 +1,239 @@
+{
+  "paper_label": "Appendix Table 5",
+  "sample_seeds": [
+    41,
+    42,
+    43
+  ],
+  "full_seeds": [
+    41,
+    42,
+    43,
+    44,
+    45
+  ],
+  "configs": [
+    {
+      "id": "gensco_mis_er_c500",
+      "solver": "gensco",
+      "task": "mis",
+      "size": "er",
+      "cycles": 500,
+      "selection_protocol": "test-subset-selected",
+      "config_id": "cfg-b7b7b8c7b5205b897ce2",
+      "sample": true,
+      "args": [
+        "--data",
+        "{assets}/datasets/er_700_800_test.npz",
+        "--ckpt",
+        "{assets}/ckpts/mis_er.ckpt",
+        "--cycles",
+        "500",
+        "--seed",
+        "{seed}",
+        "--batch-size",
+        "32",
+        "--threads",
+        "4"
+      ],
+      "baseline_args": [
+        "--setting",
+        "baseline",
+        "--config",
+        "{root}/reproduce/gensco_mis/baseline.json"
+      ],
+      "pisg_args": [
+        "--setting",
+        "pisg",
+        "--config",
+        "{root}/reproduce/gensco_mis/er.json"
+      ],
+      "baseline_identity": "unguided baseline at the default flip rate [0.25,0.4]; the stronger of the two tested baseline flip rates"
+    },
+    {
+      "id": "gensco_mis_er_c1000",
+      "solver": "gensco",
+      "task": "mis",
+      "size": "er",
+      "cycles": 1000,
+      "selection_protocol": "test-subset-selected",
+      "config_id": "cfg-b7b7b8c7b5205b897ce2",
+      "sample": false,
+      "args": [
+        "--data",
+        "{assets}/datasets/er_700_800_test.npz",
+        "--ckpt",
+        "{assets}/ckpts/mis_er.ckpt",
+        "--cycles",
+        "1000",
+        "--seed",
+        "{seed}",
+        "--batch-size",
+        "32",
+        "--threads",
+        "4"
+      ],
+      "baseline_args": [
+        "--setting",
+        "baseline",
+        "--config",
+        "{root}/reproduce/gensco_mis/baseline.json"
+      ],
+      "pisg_args": [
+        "--setting",
+        "pisg",
+        "--config",
+        "{root}/reproduce/gensco_mis/er.json"
+      ],
+      "baseline_identity": "unguided baseline at the default flip rate [0.25,0.4]; the stronger of the two tested baseline flip rates"
+    },
+    {
+      "id": "gensco_mis_er_c2000",
+      "solver": "gensco",
+      "task": "mis",
+      "size": "er",
+      "cycles": 2000,
+      "selection_protocol": "test-subset-selected",
+      "config_id": "cfg-b7b7b8c7b5205b897ce2",
+      "sample": false,
+      "args": [
+        "--data",
+        "{assets}/datasets/er_700_800_test.npz",
+        "--ckpt",
+        "{assets}/ckpts/mis_er.ckpt",
+        "--cycles",
+        "2000",
+        "--seed",
+        "{seed}",
+        "--batch-size",
+        "32",
+        "--threads",
+        "4"
+      ],
+      "baseline_args": [
+        "--setting",
+        "baseline",
+        "--config",
+        "{root}/reproduce/gensco_mis/baseline.json"
+      ],
+      "pisg_args": [
+        "--setting",
+        "pisg",
+        "--config",
+        "{root}/reproduce/gensco_mis/er.json"
+      ],
+      "baseline_identity": "unguided baseline at the default flip rate [0.25,0.4]; the stronger of the two tested baseline flip rates"
+    },
+    {
+      "id": "gensco_mis_rb_c500",
+      "solver": "gensco",
+      "task": "mis",
+      "size": "rb",
+      "cycles": 500,
+      "selection_protocol": "test-subset-selected",
+      "config_id": "cfg-f32fe47a2da5f08df986",
+      "sample": false,
+      "args": [
+        "--data",
+        "{assets}/datasets/rb_200_300_test.npz",
+        "--ckpt",
+        "{assets}/ckpts/mis_rb.ckpt",
+        "--cycles",
+        "500",
+        "--seed",
+        "{seed}",
+        "--batch-size",
+        "100",
+        "--threads",
+        "5"
+      ],
+      "baseline_args": [
+        "--setting",
+        "baseline",
+        "--config",
+        "{root}/reproduce/gensco_mis/rb_baseline.json"
+      ],
+      "pisg_args": [
+        "--setting",
+        "pisg",
+        "--config",
+        "{root}/reproduce/gensco_mis/rb.json"
+      ],
+      "baseline_identity": "unguided baseline at the RB PISG flip rate [0.35,0.5]; the stronger of the two tested baseline flip rates"
+    },
+    {
+      "id": "gensco_mis_rb_c1000",
+      "solver": "gensco",
+      "task": "mis",
+      "size": "rb",
+      "cycles": 1000,
+      "selection_protocol": "test-subset-selected",
+      "config_id": "cfg-f32fe47a2da5f08df986",
+      "sample": false,
+      "args": [
+        "--data",
+        "{assets}/datasets/rb_200_300_test.npz",
+        "--ckpt",
+        "{assets}/ckpts/mis_rb.ckpt",
+        "--cycles",
+        "1000",
+        "--seed",
+        "{seed}",
+        "--batch-size",
+        "100",
+        "--threads",
+        "5"
+      ],
+      "baseline_args": [
+        "--setting",
+        "baseline",
+        "--config",
+        "{root}/reproduce/gensco_mis/rb_baseline.json"
+      ],
+      "pisg_args": [
+        "--setting",
+        "pisg",
+        "--config",
+        "{root}/reproduce/gensco_mis/rb.json"
+      ],
+      "baseline_identity": "unguided baseline at the RB PISG flip rate [0.35,0.5]; the stronger of the two tested baseline flip rates"
+    },
+    {
+      "id": "gensco_mis_rb_c2000",
+      "solver": "gensco",
+      "task": "mis",
+      "size": "rb",
+      "cycles": 2000,
+      "selection_protocol": "test-subset-selected",
+      "config_id": "cfg-f32fe47a2da5f08df986",
+      "sample": false,
+      "args": [
+        "--data",
+        "{assets}/datasets/rb_200_300_test.npz",
+        "--ckpt",
+        "{assets}/ckpts/mis_rb.ckpt",
+        "--cycles",
+        "2000",
+        "--seed",
+        "{seed}",
+        "--batch-size",
+        "100",
+        "--threads",
+        "5"
+      ],
+      "baseline_args": [
+        "--setting",
+        "baseline",
+        "--config",
+        "{root}/reproduce/gensco_mis/rb_baseline.json"
+      ],
+      "pisg_args": [
+        "--setting",
+        "pisg",
+        "--config",
+        "{root}/reproduce/gensco_mis/rb.json"
+      ],
+      "baseline_identity": "unguided baseline at the RB PISG flip rate [0.35,0.5]; the stronger of the two tested baseline flip rates"
+    }
+  ]
+}

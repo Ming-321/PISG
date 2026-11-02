@@ -1,0 +1,16 @@
+{
+  "python": {
+    "difusco": "/path/to/conda/envs/difusco/bin/python",
+    "t2t": "/path/to/conda/envs/t2t/bin/python",
+    "fastt2t": "/path/to/conda/envs/fastt2t/bin/python",
+    "strudico": "/path/to/conda/envs/strudico/bin/python",
+    "gensco": "/path/to/conda/envs/gensco/bin/python"
+  },
+  "resources": {
+    "difusco": "/path/to/difusco/resources",
+    "t2t": "/path/to/t2t/resources",
+    "fastt2t": "/path/to/fastt2t/resources",
+    "strudico": "/path/to/strudico/resources",
+    "gensco": "/path/to/gensco/resources"
+  }
+}

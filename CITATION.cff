@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "Please cite PISG and the underlying solver when using this code."
+title: "PISG: Constraint-Aligned Signal Amplification for Diffusion-Based Combinatorial Optimization"
+type: software
+authors:
+  - family-names: Zhang
+    given-names: Yuming
+  - family-names: Zhou
+    given-names: Xianchen
+  - family-names: Wang
+    given-names: Hongxia
+license: MIT
+repository-code: "https://github.com/Ming-321/PISG"
+preferred-citation:
+  type: conference-paper
+  title: "PISG: Constraint-Aligned Signal Amplification for Diffusion-Based Combinatorial Optimization"
+  authors:
+    - family-names: Zhang
+      given-names: Yuming
+    - family-names: Zhou
+      given-names: Xianchen
+    - family-names: Wang
+      given-names: Hongxia
+  year: 2026
+  url: "https://openreview.net/forum?id=5G4RbpOCB8"
+  conference:
+    name: "NeurIPS 2026"

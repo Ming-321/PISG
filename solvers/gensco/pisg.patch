@@ -1,0 +1,1054 @@
+--- a/models/MISModel.py
++++ b/models/MISModel.py
+@@ -182,17 +182,35 @@
+         features: jax.Array, 
+         current_state: jax.Array,
+         timestep: jax.Array, 
+-        adjmat: jax.Array,
+-        num_nodes: jax.Array,
+-        attn_options: dict[str, Any] = {},
++        adjmat: jax.Array | None = None,
++        num_nodes: jax.Array | None = None,
++        attn_options: dict[str, Any] | list[dict[str, Any]] = {},
+         force_fp32_logit: bool = True,
++        alt_bias: jax.Array | None = None,
++        alt_bias_layers: tuple[int, ...] | None = None,
+     ):
+-        adjmat = adjmat.astype(jnp.float16)
+-        
+-        num_nodes_padded = adjmat.shape[-1]
+-        segment_ids = self.get_segment_ids(num_nodes, num_nodes_padded)
+-        # attn_options.update(softcap=self.softcap, segment_ids=segment_ids, bias=adjmat)
+-        attn_options.update(softcap=self.softcap, bias=adjmat)
++        if not isinstance(attn_options, (list, tuple)):
++            adjmat = adjmat.astype(jnp.float16)
++            alt_bias = alt_bias.astype(jnp.float16) if alt_bias is not None else None
++
++            num_nodes_padded = adjmat.shape[-1]
++            segment_ids = self.get_segment_ids(num_nodes, num_nodes_padded)
++            attn_options = dict(attn_options)
++            if alt_bias_layers is None:
++                attn_options.update(softcap=self.softcap, bias=adjmat)
++            else:
++                num_decoder_layers = len(self.decoder.layers)
++                invalid_layers = [idx for idx in alt_bias_layers if idx < 0 or idx >= num_decoder_layers]
++                if invalid_layers:
++                    raise ValueError(f'Invalid decoder layer indices: {invalid_layers}')
++                alt_bias_flags = [i in alt_bias_layers for i in range(num_decoder_layers)]
++                attn_options = [
++                    dict(attn_options, softcap=self.softcap, bias=alt_bias if use_alt else adjmat)
++                    for use_alt in alt_bias_flags
++                ]
++        else:
++            num_nodes_padded = features.shape[1]
++            segment_ids = self.get_segment_ids(num_nodes, num_nodes_padded)
+ 
+         features = self.mid_proj(features)
+         features = features + self.timestep_embedder(timestep).astype(features.dtype)[:, None]
+--- a/models/TSPModel.py
++++ b/models/TSPModel.py
+@@ -145,7 +145,8 @@
+         )
+         self.apply_final_norm = final_norm
+ 
+-    def encode(self, raw_features: jax.Array, attn_options: dict[str, Any] = {}):
++    def encode(self, raw_features: jax.Array, attn_options: dict[str, Any] | None = None):
++        attn_options = {} if attn_options is None else dict(attn_options)
+         attn_options.update(softcap=self.softcap, sm_scale=self.sm_scale)
+         features = self.init_proj(raw_features)
+         features = self.encoder(features, attn_options=attn_options)
+@@ -155,15 +156,37 @@
+         self, 
+         features: jax.Array, 
+         timestep: jax.Array, 
+-        adjmat: jax.Array | None,
+-        attn_options: dict[str, Any] = {},
++        adjmat: jax.Array | None = None,
++        attn_options: dict[str, Any] | list[dict[str, Any]] | None = None,
+         target: Literal['logit', 'embed'] = 'logit',
+         force_fp32_logit: bool = True,
++        alt_bias: jax.Array | None = None,
++        alt_bias_layers: tuple[int, ...] | None = None,
+     ):
+-        if adjmat is not None:
+-            if adjmat.shape[-1] > 128 or not jnp.issubdtype(adjmat.dtype, jnp.floating):
+-                adjmat = adjmat.astype(jnp.float16)
+-        attn_options.update(softcap=self.softcap, bias=adjmat, sm_scale=self.sm_scale)
++        if not isinstance(attn_options, (list, tuple)):
++            def _maybe_cast_bias(bias: jax.Array | None):
++                if bias is not None:
++                    if bias.shape[-1] > 128 or not jnp.issubdtype(bias.dtype, jnp.floating):
++                        bias = bias.astype(jnp.float16)
++                return bias
++
++            adjmat = _maybe_cast_bias(adjmat)
++            alt_bias = _maybe_cast_bias(alt_bias)
++
++            attn_options = {} if attn_options is None else dict(attn_options)
++            attn_options.update(softcap=self.softcap, sm_scale=self.sm_scale)
++            if alt_bias_layers is None:
++                attn_options.update(bias=adjmat)
++            else:
++                num_decoder_layers = len(self.decoder.layers)
++                invalid_layers = [layer_idx for layer_idx in alt_bias_layers if layer_idx < 0 or layer_idx >= num_decoder_layers]
++                if invalid_layers:
++                    raise ValueError(f'Invalid decoder layer indices: {invalid_layers}')
++                alt_bias_flags = [layer_idx in alt_bias_layers for layer_idx in range(num_decoder_layers)]
++                attn_options = [
++                    dict(attn_options, bias=alt_bias if use_alt_bias else adjmat)
++                    for use_alt_bias in alt_bias_flags
++                ]
+         features = self.mid_proj(features)
+         features = features + self.timestep_embedder(timestep).astype(features.dtype)[:, None]
+         features = self.decoder(features, attn_options=attn_options)
+--- a/modules/MultiHeadAttention.py
++++ b/modules/MultiHeadAttention.py
+@@ -4,6 +4,105 @@
+ from typing import Callable, Any
+ 
+ from .functional.attention.triton.wrapper import attention_fn as triton_attention_fn
++
++
++def _expand_bias(bias: jax.Array | None, dtype: jax.typing.DTypeLike) -> jax.Array | None:
++    if bias is None:
++        return None
++    if bias.ndim == 3:
++        bias = jnp.expand_dims(bias, axis=1)
++    return bias.astype(dtype)
++
++
++def _valid_masks(segment_ids: jax.Array | None, dtype: jax.typing.DTypeLike) -> tuple[jax.Array | None, jax.Array | None]:
++    if segment_ids is None:
++        return None, None
++    valid_queries = (segment_ids == 0).astype(dtype)[:, None, :, None]
++    valid_keys = (segment_ids == 0).astype(dtype)[:, None, None, :]
++    return valid_queries, valid_keys
++
++
++def _uniform_probs(scores: jax.Array, valid_keys: jax.Array | None) -> jax.Array:
++    if valid_keys is None:
++        return jnp.full_like(scores, 1.0 / scores.shape[-1])
++    denom = jnp.maximum(valid_keys.sum(axis=-1, keepdims=True), 1.0)
++    return valid_keys / denom
++
++
++def _manual_attention(
++    q: jax.Array,
++    k: jax.Array,
++    v: jax.Array,
++    *,
++    bias: jax.Array | None = None,
++    sm_scale: float | None = None,
++    softcap: float | None = None,
++    segment_ids: jax.Array | None = None,
++    pisg_attn_mode: str | None = None,
++    pisg_attn_rho: float = 1.0,
++    pisg_bad_branch_start: int = 0,
++) -> jax.Array:
++    orig_dtype = q.dtype
++    q = q.astype(jnp.float32)
++    k = k.astype(jnp.float32)
++    v = v.astype(jnp.float32)
++
++    scale = q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
++    scores = jnp.einsum('bqhd,bkhd->bhqk', q, k) * scale
++    if softcap is not None:
++        scores = softcap * jnp.tanh(scores / softcap)
++
++    bias = _expand_bias(bias, jnp.float32)
++    if bias is not None:
++        scores = scores + bias
++
++    valid_queries, valid_keys = _valid_masks(segment_ids, scores.dtype)
++    if valid_keys is not None:
++        large_neg = jnp.finfo(scores.dtype).min
++        scores = jnp.where(valid_keys > 0, scores, large_neg)
++
++    if pisg_attn_mode is None:
++        probs = jax.nn.softmax(scores, axis=-1)
++    else:
++        split = max(0, min(scores.shape[0], pisg_bad_branch_start))
++        good_scores = scores[:split]
++        bad_scores = scores[split:]
++
++        probs_good = jax.nn.softmax(good_scores, axis=-1) if split > 0 else scores[:0]
++        probs_bad = jax.nn.softmax(bad_scores, axis=-1)
++        bad_valid_queries = None if valid_queries is None else valid_queries[split:]
++        bad_valid_keys = None if valid_keys is None else valid_keys[split:]
++        uniform_bad = _uniform_probs(probs_bad, bad_valid_keys)
++
++        if pisg_attn_mode == 'conservative':
++            probs_bad = pisg_attn_rho * probs_bad + (1.0 - pisg_attn_rho) * uniform_bad
++        elif pisg_attn_mode == 'moderate':
++            # Softmax is invariant to the removed row mean. Scaling directly
++            # avoids mixing masked sentinel values into that mean.
++            bad_scores = pisg_attn_rho * bad_scores
++            if bad_valid_keys is not None:
++                large_neg = jnp.finfo(bad_scores.dtype).min
++                bad_scores = jnp.where(bad_valid_keys > 0, bad_scores, large_neg)
++            probs_bad = jax.nn.softmax(bad_scores, axis=-1)
++        elif pisg_attn_mode == 'aggressive':
++            if bad_valid_queries is None:
++                template = probs_bad.mean(axis=-2, keepdims=True)
++            else:
++                weights = bad_valid_queries
++                denom = jnp.maximum(weights.sum(axis=-2, keepdims=True), 1.0)
++                template = (probs_bad * weights).sum(axis=-2, keepdims=True) / denom
++            probs_bad = pisg_attn_rho * probs_bad + (1.0 - pisg_attn_rho) * template
++        else:
++            raise ValueError(f'Unsupported pisg_attn_mode: {pisg_attn_mode}')
++
++        probs = jnp.concatenate([probs_good, probs_bad], axis=0) if split > 0 else probs_bad
++
++    if valid_queries is not None:
++        probs = probs * valid_queries
++    out = jnp.einsum('bhqk,bkhd->bqhd', probs, v)
++    if valid_queries is not None:
++        out = out * valid_queries.transpose(0, 2, 1, 3)
++    return out.astype(orig_dtype)
+ 
+ 
+ def attention_fn(
+@@ -140,7 +239,12 @@
+         batch_size, seqlen, embed_dim = x.shape
+         num_heads = self.num_heads
+         x = x.astype(self.dtype)
+-        
++        attn_options = dict(attn_options)
++        pisg_attn_mode = attn_options.pop('pisg_attn_mode', None)
++        pisg_attn_rho = attn_options.pop('pisg_attn_rho', 1.0)
++        pisg_bad_branch_start = attn_options.pop('pisg_bad_branch_start', 0)
++        use_manual_attention = pisg_attn_mode is not None
++
+         out_proj_params = self.out_proj_params.value.astype(self.dtype)
+         head_dim = embed_dim // num_heads
+ 
+@@ -154,7 +258,18 @@
+            
+             if self.normalize_qk:
+                 qkv = qkv.at[:, :, :2].set(self.norm_fn(qkv[:, :, :2]))
+-            out = self.attention_fn(qkv=qkv, **attn_options)
++            if use_manual_attention:
++                q, k, v = jnp.split(qkv, 3, axis=2)
++                q, k, v = jax.tree.map(lambda y: jnp.squeeze(y, axis=2), [q, k, v])
++                out = _manual_attention(
++                    q, k, v,
++                    pisg_attn_mode=pisg_attn_mode,
++                    pisg_attn_rho=pisg_attn_rho,
++                    pisg_bad_branch_start=pisg_bad_branch_start,
++                    **attn_options,
++                )
++            else:
++                out = self.attention_fn(qkv=qkv, **attn_options)
+         else:
+             q_proj_param, k_proj_param, v_proj_param = [p.value.astype(self.dtype) for p in self.qkv_proj_params]
+             q, k, v = jax.tree.map(
+@@ -164,10 +279,17 @@
+             if self.normalize_qk:
+                 q = self.norm_fn(q)
+                 k = self.norm_fn(k)
+-            out = self.attention_fn(q=q, k=k, v=v, **attn_options)
++            if use_manual_attention:
++                out = _manual_attention(
++                    q, k, v,
++                    pisg_attn_mode=pisg_attn_mode,
++                    pisg_attn_rho=pisg_attn_rho,
++                    pisg_bad_branch_start=pisg_bad_branch_start,
++                    **attn_options,
++                )
++            else:
++                out = self.attention_fn(q=q, k=k, v=v, **attn_options)
+                 
+         out = out.reshape(batch_size, seqlen, -1)
+         out = jnp.dot(out, out_proj_params)
+         return out
+-
+-
+--- a/modules/TransformerEncoder.py
++++ b/modules/TransformerEncoder.py
+@@ -40,7 +40,12 @@
+     def __call__(self, features: jax.Array, attn_options: dict[str, tp.Any] | None = None):
+         if attn_options is None:
+             attn_options = self.default_attn_options
+-        for layer in self.layers:
+-            features = layer(features, attn_options)
++        if isinstance(attn_options, (list, tuple)):
++            if len(attn_options) != len(self.layers):
++                raise ValueError(f'Expected {len(self.layers)} layer attn configs, got {len(attn_options)}')
++            for layer, layer_attn_options in zip(self.layers, attn_options):
++                features = layer(features, layer_attn_options)
++        else:
++            for layer in self.layers:
++                features = layer(features, attn_options)
+         return features
+-
+--- a/decoding/continuous_sampling.py
++++ b/decoding/continuous_sampling.py
+@@ -43,7 +43,8 @@
+ def sample_dpmpp_2m(
+     denoised_fn: tp.Callable[[jax.Array, jax.Array], jax.Array], 
+     x: jax.Array, timesteps: jax.Array,
+-    *, ascending: bool = True, force_fp32: bool = True, 
++    *, ascending: bool = True, force_fp32: bool = True,
++    need_history: bool = False,
+ ):
+     """DPM-Solver++(2M)."""
+ 
+@@ -60,10 +61,13 @@
+     sigma_fn = lambda t: jnp.exp(-t)
+     t_fn = lambda sigma: -jnp.log(sigma)
+ 
++    denoised_history: list[jax.Array] = []
++
+     old_denoised = None
+     num_steps = len(sigmas) - 1 
+     for i in range(num_steps):
+         denoised = denoised_fn(x, jax.lax.broadcast_in_dim(1 - sigmas[i], shape=[batch_size], broadcast_dimensions=[]))
++        denoised_history.append(denoised)
+         if force_fp32:
+             denoised = denoised.astype(jnp.float32)
+         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+@@ -76,5 +80,9 @@
+             denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
+             x = (sigma_fn(t_next) / sigma_fn(t)) * x - jnp.expm1(-h) * denoised_d
+         old_denoised = denoised
+-    return x
+ 
++    if not need_history:
++        return x
++    else:
++        return x, denoised_history
++
+--- a/decoding/utils.py
++++ b/decoding/utils.py
+@@ -48,6 +48,62 @@
+     
+ 
+ 
++def build_pisg_layerwise_options(
++    bias_good: jax.Array,
++    bias_bad: jax.Array,
++    pisg_layer_indices: tuple[int, ...] | None,
++    num_decoder_layers: int,
++    softcap: float | None,
++    sm_scale: float | None = None,
++    bias_dtype: jax.typing.DTypeLike | None = None,
++) -> list[dict]:
++    if bias_dtype is not None:
++        bias_good = bias_good.astype(bias_dtype)
++        bias_bad = bias_bad.astype(bias_dtype)
++    bias_pisg = jnp.concatenate([bias_good, bias_bad], axis=0)
++    bias_normal = jnp.concatenate([bias_good, bias_good], axis=0)
++    options: list[dict] = []
++    for i in range(num_decoder_layers):
++        d: dict = {'softcap': softcap}
++        if sm_scale is not None:
++            d['sm_scale'] = sm_scale
++        d['bias'] = bias_pisg if (pisg_layer_indices is None or i in pisg_layer_indices) else bias_normal
++        options.append(d)
++    return options
++
++
++def build_layerwise_attention_options(
++    bias_default: jax.Array | None,
++    bias_selected: jax.Array | None,
++    selected_layers: tuple[int, ...] | None,
++    num_layers: int,
++    softcap: float | None,
++    sm_scale: float | None = None,
++    bias_dtype: jax.typing.DTypeLike | None = None,
++    segment_ids: jax.Array | None = None,
++    selected_extra: dict | None = None,
++) -> list[dict]:
++    if bias_default is not None and bias_dtype is not None:
++        bias_default = bias_default.astype(bias_dtype)
++    if bias_selected is not None and bias_dtype is not None:
++        bias_selected = bias_selected.astype(bias_dtype)
++
++    options: list[dict] = []
++    for i in range(num_layers):
++        d: dict = {'softcap': softcap}
++        if sm_scale is not None:
++            d['sm_scale'] = sm_scale
++        if segment_ids is not None:
++            d['segment_ids'] = segment_ids
++
++        use_selected = selected_layers is None or i in selected_layers
++        d['bias'] = bias_selected if use_selected else bias_default
++        if use_selected and selected_extra is not None:
++            d.update(selected_extra)
++        options.append(d)
++    return options
++
++
+ class CoordDynamicAugment:
+     def __init__(
+         self, 
+@@ -91,4 +147,3 @@
+             return self.feature_list[0]
+         else:
+             return self.feature_list[generator.integers(0, self.augment_num)]
+-
+--- a/decoding/tsp.py
++++ b/decoding/tsp.py
+@@ -6,6 +6,8 @@
+ from flax import nnx
+ import threading
+ import tqdm
++import json
++import os
+ from concurrent.futures import ThreadPoolExecutor
+ 
+ from models import TSPModel, TSPModelConfig
+@@ -25,6 +27,8 @@
+ from decoding.utils import (
+     convert_heatmap_dtype, 
+     CoordDynamicAugment as DynamicAugment,
++    build_pisg_layerwise_options,
++    build_layerwise_attention_options,
+ )
+ from functools import partial
+ 
+@@ -43,6 +47,19 @@
+     augment_level: int,
+     threads_over_batches: int | None,
+     seed: int,
++    pisg_scale: float = 0.,
++    pisg_rho: float = 0.,
++    pisg_layers: int | tuple[int, ...] | list[int] | None = None,
++    pisg_schedule: str = 'constant',
++    pisg_parallel: bool = True,
++    pisg_target: str = 'bias',
++    pisg_attn_mode: str = 'conservative',
++    pisg_attn_rho: float | None = None,
++    save_intermediates: str | None = None,
++    trajectory_capture_dir: str | None = None,
++    trajectory_capture_cycles: tuple[int, ...] | list[int] | None = None,
++    trajectory_condition: str = 'pisg',
++    guidance_enabled: bool = True,
+ ):      
+     np.random.seed(seed)
+ 
+@@ -67,6 +84,30 @@
+     
+     num_instances, num_nodes, _ = coords.shape
+     cpu_device = jax.devices('cpu')[0]
++    num_decoder_layers = len(model.decoder.layers)
++
++    if pisg_layers is None:
++        pisg_layer_indices = None
++    else:
++        if isinstance(pisg_layers, int):
++            pisg_layers = (pisg_layers,)
++        else:
++            pisg_layers = tuple(pisg_layers)
++        pisg_layer_indices = tuple(sorted({layer - 1 for layer in pisg_layers}))
++        invalid_layers = [layer for layer in pisg_layers if layer < 1 or layer > num_decoder_layers]
++        if invalid_layers:
++            raise ValueError(f'pisg_layers should be 1-based decoder layer indices in [1, {num_decoder_layers}], got {invalid_layers}')
++    if pisg_schedule not in {'constant', 'linear'}:
++        raise ValueError(f'Unsupported pisg_schedule: {pisg_schedule}')
++    if pisg_target not in {'bias', 'hybrid'}:
++        raise ValueError(f'Unsupported pisg_target: {pisg_target}')
++    if pisg_attn_mode not in {'conservative', 'moderate', 'aggressive'}:
++        raise ValueError(f'Unsupported pisg_attn_mode: {pisg_attn_mode}')
++    if pisg_attn_rho is None:
++        pisg_attn_rho = pisg_rho
++    use_hybrid_pisg = pisg_scale > 0 and pisg_target == 'hybrid'
++    guidance_scale = pisg_scale if guidance_enabled else 0.
++    capture_cycles = frozenset(trajectory_capture_cycles or ())
+ 
+     @jax.jit
+     def encode(raw_features: jax.Array):
+@@ -80,10 +121,71 @@
+         sols: jax.Array,
+     ):
+         timesteps = get_linear_timesteps(sampling_steps)
+-        def denoised_fn(adjmat: jax.Array, timestep: jax.Array):
+-            logits = model.decode(features, timestep, adjmat)
+-            adjmat = jax.nn.softmax(logits, axis=-1) * 2
+-            return adjmat
++        _bias_dtype = jnp.float16 if num_nodes > 128 else None
++        if use_hybrid_pisg:
++            def denoised_fn(adjmat: jax.Array, timestep: jax.Array):
++                if pisg_schedule == 'linear':
++                    scale = guidance_scale * timestep
++                else:
++                    scale = jnp.full_like(timestep, guidance_scale)
++                adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++                good_options = build_layerwise_attention_options(
++                    adjmat, adjmat, pisg_layer_indices,
++                    num_decoder_layers, model.softcap, model.sm_scale,
++                    bias_dtype=_bias_dtype,
++                )
++                bad_options = build_layerwise_attention_options(
++                    adjmat, adjmat_bad, pisg_layer_indices,
++                    num_decoder_layers, model.softcap, model.sm_scale,
++                    bias_dtype=_bias_dtype,
++                    selected_extra={
++                        'pisg_attn_mode': pisg_attn_mode,
++                        'pisg_attn_rho': pisg_attn_rho,
++                    },
++                )
++                logits_good = model.decode(features, timestep, attn_options=good_options)
++                logits_bad = model.decode(features, timestep, attn_options=bad_options)
++                logits = logits_good + scale[:, None, None] * (logits_good - logits_bad)
++                return jax.nn.softmax(logits, axis=-1) * 2
++        elif pisg_scale > 0 and pisg_parallel:
++            features_dup = jnp.concatenate([features, features], axis=0)
++            def denoised_fn(adjmat: jax.Array, timestep: jax.Array):
++                if pisg_schedule == 'linear':
++                    scale = guidance_scale * timestep
++                else:
++                    scale = jnp.full_like(timestep, guidance_scale)
++                adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++                layerwise_options = build_pisg_layerwise_options(
++                    adjmat, adjmat_bad, pisg_layer_indices,
++                    num_decoder_layers, model.softcap, model.sm_scale,
++                    bias_dtype=_bias_dtype,
++                )
++                timestep_dup = jnp.concatenate([timestep, timestep], axis=0)
++                logits_dup = model.decode(features_dup, timestep_dup, attn_options=layerwise_options)
++                logits_good, logits_bad = jnp.split(logits_dup, 2, axis=0)
++                logits = logits_good + scale[:, None, None] * (logits_good - logits_bad)
++                return jax.nn.softmax(logits, axis=-1) * 2
++        else:
++            def denoised_fn(adjmat: jax.Array, timestep: jax.Array):
++                logits = model.decode(features, timestep, adjmat)
++                if pisg_scale > 0:
++                    if pisg_schedule == 'linear':
++                        scale = guidance_scale * timestep
++                    else:
++                        scale = jnp.full_like(timestep, guidance_scale)
++                    adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else None
++                    if pisg_layer_indices is None:
++                        logits_bad = model.decode(features, timestep, adjmat_bad)
++                    else:
++                        logits_bad = model.decode(
++                            features,
++                            timestep,
++                            adjmat,
++                            alt_bias=adjmat_bad,
++                            alt_bias_layers=pisg_layer_indices,
++                        )
++                    logits = logits + scale[:, None, None] * (logits - logits_bad)
++                return jax.nn.softmax(logits, axis=-1) * 2
+         adjmat = sol2adj(sols, dtype=jnp.float16 if num_nodes > 128 else jnp.float32)
+         adjmat_pred = sample_dpmpp_2m(denoised_fn, adjmat, timesteps)
+         adjmat_pred = convert_heatmap_dtype(adjmat_pred, dtype=heatmap_dtype)
+@@ -100,9 +202,141 @@
+         candidate_edges = jnp.stack(jnp.divmod(candidate_edges, num_nodes), axis=-1)
+         return candidate_edges
+     
++    @jax.jit
++    def decode_for_analysis(
++        features: jax.Array,
++        sols: jax.Array,
++    ):
++        """Run one denoising pass and return per-step logits_good / logits_bad."""
++        timesteps = get_linear_timesteps(sampling_steps)
++        _bias_dtype = jnp.float16 if num_nodes > 128 else None
++
++        logits_good_list: list[jax.Array] = []
++        logits_bad_list: list[jax.Array] = []
++        timestep_list: list[jax.Array] = []
++
++        if use_hybrid_pisg:
++            def denoised_fn_capture(adjmat: jax.Array, timestep: jax.Array):
++                if pisg_schedule == 'linear':
++                    scale = guidance_scale * timestep
++                else:
++                    scale = jnp.full_like(timestep, guidance_scale)
++                adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++                good_options = build_layerwise_attention_options(
++                    adjmat, adjmat, pisg_layer_indices,
++                    num_decoder_layers, model.softcap, model.sm_scale,
++                    bias_dtype=_bias_dtype,
++                )
++                bad_options = build_layerwise_attention_options(
++                    adjmat, adjmat_bad, pisg_layer_indices,
++                    num_decoder_layers, model.softcap, model.sm_scale,
++                    bias_dtype=_bias_dtype,
++                    selected_extra={
++                        'pisg_attn_mode': pisg_attn_mode,
++                        'pisg_attn_rho': pisg_attn_rho,
++                    },
++                )
++                logits_good = model.decode(features, timestep, attn_options=good_options)
++                logits_bad = model.decode(features, timestep, attn_options=bad_options)
++                logits_good_list.append(logits_good)
++                logits_bad_list.append(logits_bad)
++                timestep_list.append(timestep[0])
++                logits = logits_good + scale[:, None, None] * (logits_good - logits_bad)
++                return jax.nn.softmax(logits, axis=-1) * 2
++        elif pisg_scale > 0 and pisg_parallel:
++            features_dup = jnp.concatenate([features, features], axis=0)
++            def denoised_fn_capture(adjmat: jax.Array, timestep: jax.Array):
++                if pisg_schedule == 'linear':
++                    scale = guidance_scale * timestep
++                else:
++                    scale = jnp.full_like(timestep, guidance_scale)
++                adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++                layerwise_options = build_pisg_layerwise_options(
++                    adjmat, adjmat_bad, pisg_layer_indices,
++                    num_decoder_layers, model.softcap, model.sm_scale,
++                    bias_dtype=_bias_dtype,
++                )
++                timestep_dup = jnp.concatenate([timestep, timestep], axis=0)
++                logits_dup = model.decode(features_dup, timestep_dup, attn_options=layerwise_options)
++                logits_good, logits_bad = jnp.split(logits_dup, 2, axis=0)
++                logits_good_list.append(logits_good)
++                logits_bad_list.append(logits_bad)
++                timestep_list.append(timestep[0])
++                logits = logits_good + scale[:, None, None] * (logits_good - logits_bad)
++                return jax.nn.softmax(logits, axis=-1) * 2
++        else:
++            def denoised_fn_capture(adjmat: jax.Array, timestep: jax.Array):
++                logits_good = model.decode(features, timestep, adjmat)
++                logits_good_list.append(logits_good)
++                timestep_list.append(timestep[0])
++                if pisg_scale > 0:
++                    adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else None
++                    if pisg_layer_indices is None:
++                        logits_bad = model.decode(features, timestep, adjmat_bad)
++                    else:
++                        logits_bad = model.decode(
++                            features, timestep, adjmat,
++                            alt_bias=adjmat_bad, alt_bias_layers=pisg_layer_indices,
++                        )
++                    logits_bad_list.append(logits_bad)
++                else:
++                    logits_bad_list.append(jnp.zeros_like(logits_good))
++                return jax.nn.softmax(logits_good, axis=-1) * 2
++
++        adjmat = sol2adj(sols, dtype=jnp.float16 if num_nodes > 128 else jnp.float32)
++        _ = sample_dpmpp_2m(denoised_fn_capture, adjmat, timesteps)
++
++        return (
++            jnp.stack(logits_good_list),
++            jnp.stack(logits_bad_list),
++            jnp.stack(timestep_list),
++        )
++
+     _get_costs_cpu = partial(tsp_eval_cost, num_workers=num_workers)
+ 
+-    def inference_fn(seed: int, coords: np.ndarray, dist_mat: np.ndarray):
++    if save_intermediates is not None and pisg_scale > 0:
++        os.makedirs(save_intermediates, exist_ok=True)
++        print(f'[E10] Saving intermediates to {save_intermediates}')
++        features = encode(coords[:batch_size])
++        tours = jnp.arange(num_nodes, dtype=jnp.int32)
++        key = jax.random.key(seed)
++        keys = jax.random.split(key, batch_size)
++        tours = jax.vmap(jax.random.permutation, in_axes=(0, None))(keys, tours)
++        logits_good, logits_bad, timestep_vals = decode_for_analysis(features, tours)
++        np.savez(
++            os.path.join(save_intermediates, 'tsp_intermediates.npz'),
++            logits_good=np.array(logits_good),
++            logits_bad=np.array(logits_bad),
++            timesteps=np.array(timestep_vals),
++        )
++        print(f'[E10] Saved: logits_good {logits_good.shape}, logits_bad {logits_bad.shape}, timesteps {timestep_vals.shape}')
++        return None
++
++    def _save_trajectory_capture(
++        logits_good: jax.Array,
++        logits_bad: jax.Array,
++        timesteps: jax.Array,
++        *, batch_index: int, cycle: int,
++    ) -> None:
++        if trajectory_capture_dir is None:
++            return
++        os.makedirs(trajectory_capture_dir, exist_ok=True)
++        path = os.path.join(
++            trajectory_capture_dir, f'batch_{batch_index:03d}_cycle_{cycle:03d}.npz',
++        )
++        if os.path.exists(path):
++            raise FileExistsError(f'Refusing to overwrite trajectory capture: {path}')
++        good = np.array(jax.nn.softmax(logits_good, axis=-1) * 2, dtype=np.float32)
++        bad = np.array(jax.nn.softmax(logits_bad, axis=-1) * 2, dtype=np.float32)
++        np.savez_compressed(path, p_normal=good, p_perturbed=bad, timesteps=np.array(timesteps))
++        with open(path + '.json', 'x') as f:
++            json.dump({
++                'task': 'tsp100', 'condition': trajectory_condition, 'seed': seed,
++                'batch_index': batch_index, 'cycle': cycle,
++                'instance_indices': list(range(batch_index * batch_size, (batch_index + 1) * batch_size)),
++            }, f, sort_keys=True)
++
++    def inference_fn(seed: int, coords: np.ndarray, dist_mat: np.ndarray, batch_index: int):
+         # features: jax.Array = encode(coords)
+         features_manager = DynamicAugment(encode, coords, augment_level=augment_level)
+         storage: dict[int, np.ndarray] = {}
+@@ -117,7 +351,14 @@
+             min_costs = np.full((batch_size,), np.finfo(np.float32).max, dtype=np.float32)
+             generator = np.random.default_rng(seed + r * 7)
+             for i in range(cycles):
+-                candidate_edges = decode(features_manager(generator), tours)
++                features = features_manager(generator)
++                if r == 0 and i in capture_cycles:
++                    logits_good, logits_bad, timestep_vals = decode_for_analysis(features, tours)
++                    _save_trajectory_capture(
++                        logits_good, logits_bad, timestep_vals,
++                        batch_index=batch_index, cycle=i,
++                    )
++                candidate_edges = decode(features, tours)
+                 candidate_edges = np.array(candidate_edges)
+                 tours = tsp_greedy_insert(candidate_edges, num_nodes, num_workers=num_workers)
+                 tours, tours_disrupted = tsp_double_two_opt(
+@@ -147,7 +388,7 @@
+         cost = inference_fn(
+             seed + i * 888,
+             coords[i * batch_size:(i + 1) * batch_size], 
+-            dist_mat_np[i * batch_size:(i + 1) * batch_size],
++            dist_mat_np[i * batch_size:(i + 1) * batch_size], i,
+         )
+         return cost.mean().item()
+     
+@@ -206,6 +447,20 @@
+     parser.add_argument('--topk', type=eval, default=None)
+     parser.add_argument('--augment_level', type=int, default=0)
+     parser.add_argument('--threads_over_batches', type=int, default=1)
++    parser.add_argument('--pisg_scale', type=float, default=0.)
++    parser.add_argument('--pisg_rho', type=float, default=0.)
++    parser.add_argument('--pisg_layers', type=eval, default=None)
++    parser.add_argument('--pisg_schedule', type=str, default='constant')
++    parser.add_argument('--pisg_parallel', action=argparse.BooleanOptionalAction, default=True)
++    parser.add_argument('--pisg_target', type=str, default='bias')
++    parser.add_argument('--pisg_attn_mode', type=str, default='conservative')
++    parser.add_argument('--pisg_attn_rho', type=float, default=None)
++    parser.add_argument('--save_intermediates', type=str, default=None,
++                        help='Directory to save per-step logits for E10 signal analysis')
++    parser.add_argument('--trajectory_capture_dir', type=str, default=None)
++    parser.add_argument('--trajectory_capture_cycles', type=eval, default=None)
++    parser.add_argument('--trajectory_condition', type=str, default='pisg')
++    parser.add_argument('--guidance_enabled', action=argparse.BooleanOptionalAction, default=True)
+ 
+     args = parser.parse_args()
+ 
+@@ -229,5 +484,18 @@
+         augment_level=args.augment_level,
+         threads_over_batches=args.threads_over_batches,
+         seed=args.seed,
++        pisg_scale=args.pisg_scale,
++        pisg_rho=args.pisg_rho,
++        pisg_layers=args.pisg_layers,
++        pisg_schedule=args.pisg_schedule,
++        pisg_parallel=args.pisg_parallel,
++        pisg_target=args.pisg_target,
++        pisg_attn_mode=args.pisg_attn_mode,
++        pisg_attn_rho=args.pisg_attn_rho,
++        save_intermediates=args.save_intermediates,
++        trajectory_capture_dir=args.trajectory_capture_dir,
++        trajectory_capture_cycles=args.trajectory_capture_cycles,
++        trajectory_condition=args.trajectory_condition,
++        guidance_enabled=args.guidance_enabled,
+     )
+     
+--- a/decoding/mis.py
++++ b/decoding/mis.py
+@@ -10,6 +10,7 @@
+ from helpers.mis_transform import edges2adj
+ from lib import mis_greedy_insert, mis_edges2neighbors, MISBatchedNeighbors
+ from decoding.continuous_sampling import sample_dpmpp_2m, sample_euler
++from decoding.utils import build_pisg_layerwise_options, build_layerwise_attention_options
+ 
+ 
+ def mis_flow_decode(
+@@ -23,8 +24,39 @@
+     batch_size: int,
+     threads_over_batches: int | None,
+     seed: int,
++    pisg_scale: float = 0.,
++    pisg_rho: float = 0.,
++    pisg_layers: int | tuple[int, ...] | list[int] | None = None,
++    pisg_schedule: str = 'constant',
++    pisg_parallel: bool = True,
++    pisg_target: str = 'bias',
++    pisg_attn_mode: str = 'conservative',
++    pisg_attn_rho: float | None = None,
++    save_intermediates: str | None = None,
+ ):
+     num_workers = 1
++
++    num_decoder_layers = len(model.decoder.layers)
++    if pisg_layers is None:
++        pisg_layer_indices = None
++    else:
++        if isinstance(pisg_layers, int):
++            pisg_layers = (pisg_layers,)
++        else:
++            pisg_layers = tuple(pisg_layers)
++        pisg_layer_indices = tuple(sorted({layer - 1 for layer in pisg_layers}))
++        invalid = [l for l in pisg_layers if l < 1 or l > num_decoder_layers]
++        if invalid:
++            raise ValueError(f'pisg_layers should be 1-based indices in [1, {num_decoder_layers}], got {invalid}')
++    if pisg_schedule not in {'constant', 'linear'}:
++        raise ValueError(f'Unsupported pisg_schedule: {pisg_schedule}')
++    if pisg_target not in {'bias', 'hybrid'}:
++        raise ValueError(f'Unsupported pisg_target: {pisg_target}')
++    if pisg_attn_mode not in {'conservative', 'moderate', 'aggressive'}:
++        raise ValueError(f'Unsupported pisg_attn_mode: {pisg_attn_mode}')
++    if pisg_attn_rho is None:
++        pisg_attn_rho = pisg_rho
++    use_hybrid_pisg = pisg_scale > 0 and pisg_target == 'hybrid'
+ 
+     np.random.seed(seed)
+ 
+@@ -68,9 +100,81 @@
+         num_nodes: jax.Array,
+     ):
+         timesteps = jnp.linspace(0., 1., sampling_steps + 1)
+-        def denoised_fn(solution: jax.Array, timestep: jax.Array):
+-            sigmoid_logits, _ = model.decode(features, solution, timestep, adjmat, num_nodes)
+-            return jax.nn.sigmoid(sigmoid_logits)
++        segment_ids = model.get_segment_ids(num_nodes, adjmat.shape[-1])
++        if use_hybrid_pisg:
++            def denoised_fn(solution: jax.Array, timestep: jax.Array):
++                if pisg_schedule == 'linear':
++                    scale = pisg_scale * timestep
++                else:
++                    scale = jnp.full_like(timestep, pisg_scale)
++                adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++                good_options = build_layerwise_attention_options(
++                    adjmat, adjmat, pisg_layer_indices,
++                    num_decoder_layers, model.softcap,
++                    bias_dtype=jnp.float16,
++                    segment_ids=segment_ids,
++                )
++                bad_options = build_layerwise_attention_options(
++                    adjmat, adjmat_bad, pisg_layer_indices,
++                    num_decoder_layers, model.softcap,
++                    bias_dtype=jnp.float16,
++                    segment_ids=segment_ids,
++                    selected_extra={
++                        'pisg_attn_mode': pisg_attn_mode,
++                        'pisg_attn_rho': pisg_attn_rho,
++                    },
++                )
++                sigmoid_logits, _ = model.decode(
++                    features, solution, timestep,
++                    num_nodes=num_nodes, attn_options=good_options,
++                )
++                sigmoid_logits_bad, _ = model.decode(
++                    features, solution, timestep,
++                    num_nodes=num_nodes, attn_options=bad_options,
++                )
++                sigmoid_logits = sigmoid_logits + scale[:, None] * (sigmoid_logits - sigmoid_logits_bad)
++                return jax.nn.sigmoid(sigmoid_logits)
++        elif pisg_scale > 0 and pisg_parallel:
++            adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++            layerwise_options = build_pisg_layerwise_options(
++                adjmat, adjmat_bad, pisg_layer_indices,
++                num_decoder_layers, model.softcap,
++                bias_dtype=jnp.float16,
++            )
++            features_dup = jnp.concatenate([features, features], axis=0)
++            num_nodes_dup = jnp.concatenate([num_nodes, num_nodes], axis=0)
++            def denoised_fn(solution: jax.Array, timestep: jax.Array):
++                if pisg_schedule == 'linear':
++                    scale = pisg_scale * timestep
++                else:
++                    scale = jnp.full_like(timestep, pisg_scale)
++                solution_dup = jnp.concatenate([solution, solution], axis=0)
++                timestep_dup = jnp.concatenate([timestep, timestep], axis=0)
++                sigmoid_logits_dup, _ = model.decode(
++                    features_dup, solution_dup, timestep_dup,
++                    num_nodes=num_nodes_dup, attn_options=layerwise_options,
++                )
++                good, bad = jnp.split(sigmoid_logits_dup, 2, axis=0)
++                return jax.nn.sigmoid(good + scale[:, None] * (good - bad))
++        else:
++            def denoised_fn(solution: jax.Array, timestep: jax.Array):
++                sigmoid_logits, _ = model.decode(features, solution, timestep, adjmat, num_nodes)
++                if pisg_scale > 0:
++                    if pisg_schedule == 'linear':
++                        scale = pisg_scale * timestep
++                    else:
++                        scale = jnp.full_like(timestep, pisg_scale)
++                    adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++                    if pisg_layer_indices is None:
++                        sigmoid_logits_bad, _ = model.decode(features, solution, timestep, adjmat_bad, num_nodes)
++                    else:
++                        sigmoid_logits_bad, _ = model.decode(
++                            features, solution, timestep, adjmat, num_nodes,
++                            alt_bias=adjmat_bad,
++                            alt_bias_layers=pisg_layer_indices,
++                        )
++                    sigmoid_logits = sigmoid_logits + scale[:, None] * (sigmoid_logits - sigmoid_logits_bad)
++                return jax.nn.sigmoid(sigmoid_logits)
+         if not decode_intermediate:
+             solution_pred = sample_euler(denoised_fn, solution, timesteps)
+             candidate_nodes = jnp.argsort(
+@@ -89,6 +193,132 @@
+             )
+             return candidate_nodes, history_candidate_nodes_group
+     
++    @jax.jit
++    def decode_for_analysis(
++        features: jax.Array,
++        solution: jax.Array,
++        adjmat: jax.Array,
++        num_nodes_arr: jax.Array,
++    ):
++        """Run one denoising pass and return per-step logits_good / logits_bad."""
++        timesteps = jnp.linspace(0., 1., sampling_steps + 1)
++
++        logits_good_list: list[jax.Array] = []
++        logits_bad_list: list[jax.Array] = []
++        timestep_list: list[jax.Array] = []
++        segment_ids = model.get_segment_ids(num_nodes_arr, adjmat.shape[-1])
++
++        if use_hybrid_pisg:
++            def denoised_fn_capture(solution: jax.Array, timestep: jax.Array):
++                if pisg_schedule == 'linear':
++                    scale = pisg_scale * timestep
++                else:
++                    scale = jnp.full_like(timestep, pisg_scale)
++                adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++                good_options = build_layerwise_attention_options(
++                    adjmat, adjmat, pisg_layer_indices,
++                    num_decoder_layers, model.softcap,
++                    bias_dtype=jnp.float16,
++                    segment_ids=segment_ids,
++                )
++                bad_options = build_layerwise_attention_options(
++                    adjmat, adjmat_bad, pisg_layer_indices,
++                    num_decoder_layers, model.softcap,
++                    bias_dtype=jnp.float16,
++                    segment_ids=segment_ids,
++                    selected_extra={
++                        'pisg_attn_mode': pisg_attn_mode,
++                        'pisg_attn_rho': pisg_attn_rho,
++                    },
++                )
++                good, _ = model.decode(
++                    features, solution, timestep,
++                    num_nodes=num_nodes_arr, attn_options=good_options,
++                )
++                bad, _ = model.decode(
++                    features, solution, timestep,
++                    num_nodes=num_nodes_arr, attn_options=bad_options,
++                )
++                logits_good_list.append(good)
++                logits_bad_list.append(bad)
++                timestep_list.append(timestep[0])
++                return jax.nn.sigmoid(good + scale[:, None] * (good - bad))
++        elif pisg_scale > 0 and pisg_parallel:
++            adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++            layerwise_options = build_pisg_layerwise_options(
++                adjmat, adjmat_bad, pisg_layer_indices,
++                num_decoder_layers, model.softcap,
++                bias_dtype=jnp.float16,
++            )
++            features_dup = jnp.concatenate([features, features], axis=0)
++            num_nodes_dup = jnp.concatenate([num_nodes_arr, num_nodes_arr], axis=0)
++            def denoised_fn_capture(solution: jax.Array, timestep: jax.Array):
++                if pisg_schedule == 'linear':
++                    scale = pisg_scale * timestep
++                else:
++                    scale = jnp.full_like(timestep, pisg_scale)
++                solution_dup = jnp.concatenate([solution, solution], axis=0)
++                timestep_dup = jnp.concatenate([timestep, timestep], axis=0)
++                sigmoid_logits_dup, _ = model.decode(
++                    features_dup, solution_dup, timestep_dup,
++                    num_nodes=num_nodes_dup, attn_options=layerwise_options,
++                )
++                good, bad = jnp.split(sigmoid_logits_dup, 2, axis=0)
++                logits_good_list.append(good)
++                logits_bad_list.append(bad)
++                timestep_list.append(timestep[0])
++                return jax.nn.sigmoid(good + scale[:, None] * (good - bad))
++        else:
++            def denoised_fn_capture(solution: jax.Array, timestep: jax.Array):
++                sigmoid_logits, _ = model.decode(features, solution, timestep, adjmat, num_nodes_arr)
++                logits_good_list.append(sigmoid_logits)
++                timestep_list.append(timestep[0])
++                if pisg_scale > 0:
++                    adjmat_bad = adjmat * pisg_rho if pisg_rho > 0 else jnp.zeros_like(adjmat)
++                    if pisg_layer_indices is None:
++                        sigmoid_logits_bad, _ = model.decode(features, solution, timestep, adjmat_bad, num_nodes_arr)
++                    else:
++                        sigmoid_logits_bad, _ = model.decode(
++                            features, solution, timestep, adjmat, num_nodes_arr,
++                            alt_bias=adjmat_bad, alt_bias_layers=pisg_layer_indices,
++                        )
++                    logits_bad_list.append(sigmoid_logits_bad)
++                else:
++                    logits_bad_list.append(jnp.zeros_like(sigmoid_logits))
++                return jax.nn.sigmoid(sigmoid_logits)
++
++        _ = sample_euler(denoised_fn_capture, solution, timesteps)
++
++        return (
++            jnp.stack(logits_good_list),
++            jnp.stack(logits_bad_list),
++            jnp.stack(timestep_list),
++        )
++
++    if save_intermediates is not None and pisg_scale > 0:
++        import os
++        os.makedirs(save_intermediates, exist_ok=True)
++        print(f'[E10] Saving intermediates to {save_intermediates}')
++        generator = np.random.default_rng(seed)
++        features = encode(
++            adjmat_list[0],
++            generator.integers(0, np.iinfo(np.uint32).max, size=[2], dtype=np.uint32),
++        )
++        solution = np.zeros((batch_size, num_nodes_padded), dtype=np.float32)
++        num_nodes_jax = jax.device_put(num_nodes_list[0])
++        logits_good, logits_bad, timestep_vals = decode_for_analysis(
++            features, solution, adjmat_list[0], num_nodes_jax,
++        )
++        np.savez(
++            os.path.join(save_intermediates, 'mis_intermediates.npz'),
++            logits_good=np.array(logits_good),
++            logits_bad=np.array(logits_bad),
++            timesteps=np.array(timestep_vals),
++            num_nodes=np.array(num_nodes_list[0]),
++        )
++        print(f'[E10] Saved: logits_good {logits_good.shape}, logits_bad {logits_bad.shape}, timesteps {timestep_vals.shape}')
++        return
++
+     def inference_fn(
+         seed: int, num_nodes: np.ndarray,
+         adjmat: jax.Array, neighbors: MISBatchedNeighbors,
+@@ -164,7 +394,7 @@
+     
+     def run_batch(i: int) -> float:
+         sizes = inference_fn(
+-            i * 888,
++            seed + i * 888,
+             num_nodes_list[i],
+             adjmat_list[i],
+             neighbors_list[i],
+@@ -217,6 +447,16 @@
+     parser.add_argument('--seed', type=int, default=42)
+ 
+     parser.add_argument('--decode_intermediate', action='store_true', default=False)
++    parser.add_argument('--pisg_scale', type=float, default=0.)
++    parser.add_argument('--pisg_rho', type=float, default=0.)
++    parser.add_argument('--pisg_layers', type=eval, default=None)
++    parser.add_argument('--pisg_schedule', type=str, default='constant')
++    parser.add_argument('--pisg_parallel', action=argparse.BooleanOptionalAction, default=True)
++    parser.add_argument('--pisg_target', type=str, default='bias')
++    parser.add_argument('--pisg_attn_mode', type=str, default='conservative')
++    parser.add_argument('--pisg_attn_rho', type=float, default=None)
++    parser.add_argument('--save_intermediates', type=str, default=None,
++                        help='Directory to save per-step logits for E10 signal analysis')
+ 
+     args = parser.parse_args()
+ 
+@@ -239,4 +479,13 @@
+         args.batch_size,
+         args.threads_over_batches,
+         args.seed,
++        pisg_scale=args.pisg_scale,
++        pisg_rho=args.pisg_rho,
++        pisg_layers=args.pisg_layers,
++        pisg_schedule=args.pisg_schedule,
++        pisg_parallel=args.pisg_parallel,
++        pisg_target=args.pisg_target,
++        pisg_attn_mode=args.pisg_attn_mode,
++        pisg_attn_rho=args.pisg_attn_rho,
++        save_intermediates=args.save_intermediates,
+     )

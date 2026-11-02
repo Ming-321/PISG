@@ -1,0 +1,15 @@
+outputs/
+resources/
+reproduce/local.json
+solvers/gensco/upstream/
+__pycache__/
+*.pyc
+*.so
+cython_merge*.c
+build/
+*.egg-info/
+wandb/
+*.ckpt
+*.pt
+*.npz
+*.gpickle

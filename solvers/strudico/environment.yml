@@ -1,0 +1,29 @@
+name: strudico
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10.20
+  - pip=24.0
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu124
+    - --find-links https://data.pyg.org/whl/torch-2.6.0+cu124.html
+    - torch==2.6.0+cu124
+    - torchvision==0.21.0+cu124
+    - numpy==1.26.4
+    - scipy==1.15.3
+    - networkx==2.8.8
+    - pytorch-lightning==1.8.0
+    - torchmetrics==0.11.0
+    - lightning-utilities==0.3.0
+    - torch-geometric==2.7.0
+    - torch-scatter==2.1.2+pt26cu124
+    - torch-sparse==0.6.18+pt26cu124
+    - Cython==3.2.4
+    - wandb==0.25.1
+    - scikit-learn==1.7.2
+    - matplotlib==3.10.8
+    - seaborn==0.13.2
+    - opencv-python==4.11.0.86
+    - tqdm==4.67.3
+    - tensorboardX==2.6.4
+    - setuptools==80.10.2

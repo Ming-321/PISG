@@ -1,0 +1,9 @@
+{
+  "flip_rate": [
+    0.25,
+    0.4
+  ],
+  "pisg_rho": 0,
+  "pisg_scale": 0,
+  "pisg_schedule": "constant"
+}

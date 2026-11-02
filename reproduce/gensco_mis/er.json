@@ -1,0 +1,16 @@
+{
+  "flip_rate": [
+    0.38777864,
+    0.5399507
+  ],
+  "pisg_layers": [
+    3,
+    4,
+    5,
+    6
+  ],
+  "pisg_rho": 0.15146258,
+  "pisg_scale": 0.92851813,
+  "pisg_schedule": "linear",
+  "pisg_target": "bias"
+}
